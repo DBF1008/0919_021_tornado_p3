@@ -152,10 +152,21 @@ def chain_future(
        Now accepts both Tornado/asyncio `Future` objects and
        `concurrent.futures.Future`.
 
+    .. versionchanged:: 6.6
+
+       Cancellation of ``a`` is now propagated to ``b`` (previously a
+       cancelled ``a`` would raise ``asyncio.CancelledError`` inside the
+       done callback instead of cancelling ``b``).
+
     """
 
     def copy(a: "Future[_T]") -> None:
         if b.done():
+            return
+        if a.cancelled():
+            # Propagate cancellation instead of calling a.exception(),
+            # which would re-raise CancelledError inside this callback.
+            b.cancel()
             return
         if hasattr(a, "exc_info") and a.exc_info() is not None:  # type: ignore
             future_set_exc_info(b, a.exc_info())  # type: ignore

@@ -71,6 +71,29 @@ class ChainFutureTest(AsyncTestCase):
         result = await fut3
         self.assertEqual(result, 42)
 
+    @gen_test
+    async def test_cancellation_propagates(self):
+        # Cancelling the source future must cancel the chained target
+        # instead of raising CancelledError inside the done callback.
+        fut: Future[int] = Future()
+        fut2: Future[int] = Future()
+        chain_future(fut, fut2)
+        fut.cancel()
+        await gen.sleep(0)
+        self.assertTrue(fut2.cancelled())
+
+    @gen_test
+    async def test_cancellation_does_not_override_completed_target(self):
+        # If the target already completed, cancelling the source must
+        # not disturb it.
+        fut: Future[int] = Future()
+        fut2: Future[int] = Future()
+        chain_future(fut, fut2)
+        fut2.set_result(7)
+        fut.cancel()
+        await gen.sleep(0)
+        self.assertEqual(fut2.result(), 7)
+
 
 # The following series of classes demonstrate and test various styles
 # of use, with and without generators and futures.

@@ -242,9 +242,9 @@ class Event:
             return fut
         else:
             timeout_fut = gen.with_timeout(timeout, fut)
-            # This is a slightly clumsy workaround for the fact that
-            # gen.with_timeout doesn't cancel its futures. Cancelling
-            # fut will remove it from the waiters list.
+            # gen.with_timeout cancels fut on timeout, which removes it
+            # from the waiters list. This callback also covers the case
+            # where the caller cancels timeout_fut directly.
             timeout_fut.add_done_callback(
                 lambda tf: fut.cancel() if not fut.done() else None
             )

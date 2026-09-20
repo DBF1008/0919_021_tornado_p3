@@ -778,6 +778,42 @@ class WithTimeoutTest(AsyncTestCase):
                 executor.submit(lambda: time.sleep(0.01)),
             )
 
+    @gen_test
+    def test_timeout_cancels_inner_future(self):
+        # On timeout the wrapped future must be cancelled so its
+        # resources are released promptly.
+        inner: Future[str] = Future()
+        with self.assertRaises(gen.TimeoutError):
+            yield gen.with_timeout(datetime.timedelta(seconds=0.01), inner)
+        self.assertTrue(inner.cancelled())
+
+    @gen_test
+    def test_timeout_cancels_inner_coroutine(self):
+        # Cancellation must propagate into an in-flight awaitable so
+        # the underlying operation observes CancelledError.
+        cancelled = []
+
+        async def inner():
+            try:
+                await gen.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        with self.assertRaises(gen.TimeoutError):
+            yield gen.with_timeout(datetime.timedelta(seconds=0.01), inner())
+        yield gen.moment
+        self.assertEqual(cancelled, [True])
+
+    @gen_test
+    def test_timeout_cancelled_error_is_quiet(self):
+        # The CancelledError produced by cancelling the inner future
+        # must not be logged as an unhandled exception.
+        inner: Future[str] = Future()
+        with self.assertRaises(gen.TimeoutError):
+            yield gen.with_timeout(datetime.timedelta(seconds=0.01), inner)
+        yield gen.moment
+
 
 class WaitIteratorTest(AsyncTestCase):
     @gen_test
@@ -928,6 +964,88 @@ class WaitIteratorTest(AsyncTestCase):
         yield gen.with_timeout(
             datetime.timedelta(seconds=0.1), gen.WaitIterator(gen.sleep(0)).next()
         )
+
+    @gen_test
+    def test_concurrent_next_raises(self):
+        # A second next() while the first is still pending must raise
+        # instead of silently dropping the first waiter (which could
+        # deliver the same result to two consumers).
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        g = gen.WaitIterator(f1, f2)
+        pending = g.next()
+        with self.assertRaises(Exception):
+            g.next()
+        # The original pending future still receives the first result.
+        f1.set_result(1)
+        self.assertEqual((yield pending), 1)
+        self.assertIs(g.current_future, f1)
+        # After the pending future resolves, next() works again.
+        f2.set_result(2)
+        self.assertEqual((yield g.next()), 2)
+        self.assertTrue(g.done())
+
+    @gen_test
+    def test_simultaneous_completion_no_duplicate(self):
+        # Futures completing in the same IOLoop iteration must each be
+        # delivered exactly once.
+        futures: list[Future[int]] = [Future() for _ in range(4)]
+        g = gen.WaitIterator(*futures)
+        for i, f in enumerate(futures):
+            self.io_loop.add_callback(f.set_result, i)
+        results = []
+        while not g.done():
+            results.append((yield g.next()))
+        self.assertEqual(sorted(results), [0, 1, 2, 3])
+
+
+class MultiResultTest(AsyncTestCase):
+    @gen_test
+    def test_multi_return_exceptions_list(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        f3: Future[int] = Future()
+        self.io_loop.add_callback(f1.set_result, 1)
+        self.io_loop.add_callback(f2.set_exception, ZeroDivisionError("boom"))
+        self.io_loop.add_callback(f3.set_result, 3)
+        result = yield gen.multi([f1, f2, f3], return_exceptions=True)
+        self.assertIsInstance(result, gen.MultiResult)
+        self.assertEqual(result.succeeded, {0: 1, 2: 3})
+        self.assertEqual(list(result.failed), [1])
+        self.assertIsInstance(result.failed[1], ZeroDivisionError)
+        self.assertFalse(result.ok)
+
+    @gen_test
+    def test_multi_return_exceptions_dict(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        self.io_loop.add_callback(f1.set_result, 1)
+        self.io_loop.add_callback(f2.set_exception, ValueError("bad"))
+        result = yield gen.multi(dict(a=f1, b=f2), return_exceptions=True)
+        self.assertEqual(result.succeeded, {"a": 1})
+        self.assertIsInstance(result.failed["b"], ValueError)
+
+    @gen_test
+    def test_multi_return_exceptions_all_ok(self):
+        result = yield gen.multi([gen.moment, gen.moment], return_exceptions=True)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.succeeded, {0: None, 1: None})
+        self.assertEqual(result.failed, {})
+
+    @gen_test
+    def test_multi_return_exceptions_empty(self):
+        result = yield gen.multi([], return_exceptions=True)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.succeeded, {})
+
+    @gen_test
+    def test_multi_default_still_raises(self):
+        f1: Future[int] = Future()
+        f2: Future[int] = Future()
+        self.io_loop.add_callback(f1.set_result, 1)
+        self.io_loop.add_callback(f2.set_exception, ZeroDivisionError("boom"))
+        with self.assertRaises(ZeroDivisionError):
+            yield gen.multi([f2, f1])
 
 
 class RunnerGCTest(AsyncTestCase):

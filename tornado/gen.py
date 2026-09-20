@@ -382,7 +382,20 @@ class WaitIterator:
 
         Note that this `.Future` will not be the same object as any of
         the inputs.
+
+        Only one coroutine may consume a `WaitIterator` at a time: if a
+        previous call to ``next()`` is still pending (its `.Future` has
+        not yet resolved), calling ``next()`` again raises an Exception
+        instead of silently replacing the pending `.Future` (which would
+        leave the first waiter hanging and could deliver the same result
+        to two consumers).
         """
+        if self._running_future is not None and not self._running_future.done():
+            raise Exception(
+                "WaitIterator.next() called while a previous next() is "
+                "still pending; a WaitIterator can only be consumed by "
+                "one coroutine at a time"
+            )
         self._running_future = Future()
 
         if self._finished:
@@ -391,6 +404,11 @@ class WaitIterator:
         return self._running_future
 
     def _done_callback(self, done: Future) -> None:
+        if done not in self._unfinished:
+            # This future's result has already been consumed (or it was
+            # never registered, e.g. a duplicate argument); never deliver
+            # the same result twice.
+            return
         if self._running_future and not self._running_future.done():
             self._return_result(done)
         else:
@@ -421,10 +439,43 @@ class WaitIterator:
         return self.next()
 
 
+class MultiResult:
+    """Aggregate of the settled results of a `multi` call.
+
+    Returned by `multi` (and `multi_future`) when
+    ``return_exceptions=True``. Instead of raising the first exception
+    and discarding every other outcome, all outcomes are collected so
+    the caller can make its own degradation decisions:
+
+    - ``succeeded``: a dict mapping each child's key (its index for a
+      list input, or its mapping key for a dict input) to its result.
+    - ``failed``: a dict mapping each failed child's key to its
+      exception.
+
+    .. versionadded:: 6.6
+    """
+
+    def __init__(self) -> None:
+        self.succeeded: dict[Any, Any] = {}
+        self.failed: dict[Any, BaseException] = {}
+
+    @property
+    def ok(self) -> bool:
+        """True if no child raised an exception."""
+        return not self.failed
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(succeeded={self.succeeded!r}, "
+            f"failed={self.failed!r})"
+        )
+
+
 @overload
 def multi(
     children: Sequence[_Yieldable],
     quiet_exceptions: type[Exception] | tuple[type[Exception], ...] = (),
+    return_exceptions: bool = False,
 ) -> Future[list]: ...
 
 
@@ -432,12 +483,14 @@ def multi(
 def multi(
     children: Mapping[Any, _Yieldable],
     quiet_exceptions: type[Exception] | tuple[type[Exception], ...] = (),
+    return_exceptions: bool = False,
 ) -> Future[dict]: ...
 
 
 def multi(
     children: Sequence[_Yieldable] | Mapping[Any, _Yieldable],
     quiet_exceptions: "Union[Type[Exception], Tuple[Type[Exception], ...]]" = (),
+    return_exceptions: bool = False,
 ) -> "Union[Future[List], Future[Dict]]":
     """Runs multiple asynchronous operations in parallel.
 
@@ -458,6 +511,14 @@ def multi(
     If any children raise exceptions, ``multi()`` will raise the first
     one. All others will be logged, unless they are of types
     contained in the ``quiet_exceptions`` argument.
+
+    If ``return_exceptions`` is True, exceptions are not raised;
+    instead the returned `.Future` resolves to a `MultiResult`
+    aggregate whose ``succeeded`` and ``failed`` attributes contain
+    the results and exceptions of all children, keyed by index (for
+    list inputs) or key (for dict inputs). This lets callers use
+    partial results for degradation instead of losing every result
+    when one child fails.
 
     In a ``yield``-based coroutine, it is not normally necessary to
     call this function directly, since the coroutine runner will
@@ -482,8 +543,16 @@ def multi(
        with a unified function ``multi``. Added support for yieldables
        other than ``YieldPoint`` and `.Future`.
 
+    .. versionchanged:: 6.6
+       Added the ``return_exceptions`` argument and the `MultiResult`
+       aggregate.
+
     """
-    return multi_future(children, quiet_exceptions=quiet_exceptions)
+    return multi_future(
+        children,
+        quiet_exceptions=quiet_exceptions,
+        return_exceptions=return_exceptions,
+    )
 
 
 Multi = multi
@@ -492,6 +561,7 @@ Multi = multi
 def multi_future(
     children: Sequence[_Yieldable] | Mapping[Any, _Yieldable],
     quiet_exceptions: "Union[Type[Exception], Tuple[Type[Exception], ...]]" = (),
+    return_exceptions: bool = False,
 ) -> "Union[Future[List], Future[Dict]]":
     """Wait for multiple asynchronous futures in parallel.
 
@@ -503,6 +573,10 @@ def multi_future(
        If multiple ``Futures`` fail, any exceptions after the first (which is
        raised) will be logged. Added the ``quiet_exceptions``
        argument to suppress this logging for selected exception types.
+
+    .. versionchanged:: 6.6
+       Added the ``return_exceptions`` argument; when True the result
+       is a `MultiResult` aggregate instead of raising.
 
     .. deprecated:: 4.3
        Use `multi` instead.
@@ -519,11 +593,27 @@ def multi_future(
 
     future = _create_future()
     if not children_futs:
-        future_set_result_unless_cancelled(future, {} if keys is not None else [])
+        if return_exceptions:
+            future_set_result_unless_cancelled(future, MultiResult())
+        else:
+            future_set_result_unless_cancelled(future, {} if keys is not None else [])
 
     def callback(fut: Future) -> None:
         unfinished_children.remove(fut)
         if not unfinished_children:
+            if return_exceptions:
+                aggregate = MultiResult()
+                for i, f in enumerate(children_futs):
+                    key = keys[i] if keys is not None else i
+                    if is_future(f) and f.cancelled():
+                        aggregate.failed[key] = asyncio.CancelledError()
+                        continue
+                    try:
+                        aggregate.succeeded[key] = f.result()
+                    except BaseException as e:
+                        aggregate.failed[key] = e
+                future_set_result_unless_cancelled(future, aggregate)
+                return
             result_list = []
             for f in children_futs:
                 try:
@@ -590,9 +680,14 @@ def with_timeout(
     ``quiet_exceptions`` (which may be an exception type or a sequence of
     types), or an ``asyncio.CancelledError``.
 
-    The wrapped `.Future` is not canceled when the timeout expires,
-    permitting it to be reused. `asyncio.wait_for` is similar to this
-    function but it does cancel the wrapped `.Future` on timeout.
+    When the timeout expires, the wrapped `.Future` is cancelled so that
+    its underlying operations (e.g. in-flight HTTP requests) are aborted
+    and their resources released promptly instead of running to
+    completion in the background. Note that cancellation is not
+    guaranteed to stop the underlying work: a
+    `concurrent.futures.Future` that is already running cannot be
+    cancelled, and not all asyncio-based operations respond to
+    cancellation.
 
     .. versionadded:: 4.0
 
@@ -609,12 +704,11 @@ def with_timeout(
     .. versionchanged:: 6.2
        ``tornado.util.TimeoutError`` is now an alias to ``asyncio.TimeoutError``.
 
+    .. versionchanged:: 6.6
+       The wrapped `.Future` is now cancelled when the timeout expires,
+       and the cancellation is propagated to the inner awaitable.
+
     """
-    # It's tempting to optimize this by cancelling the input future on timeout
-    # instead of creating a new one, but A) we can't know if we are the only
-    # one waiting on the input future, so cancelling it might disrupt other
-    # callers and B) concurrent futures can only be cancelled while they are
-    # in the queue, so cancellation cannot reliably bound our waiting time.
     future_converted = convert_yielded(future)
     result = _create_future()
     chain_future(future_converted, result)
@@ -634,6 +728,12 @@ def with_timeout(
     def timeout_callback() -> None:
         if not result.done():
             result.set_exception(TimeoutError("Timeout"))
+        # Cancel the wrapped future so its underlying IO operations are
+        # aborted and their resources (file descriptors, memory) released
+        # promptly, instead of running to completion before being GC'd.
+        # The resulting CancelledError is swallowed by error_callback.
+        if is_future(future_converted):
+            future_converted.cancel()
         # In case the wrapped future goes on to fail, log it.
         future_add_done_callback(future_converted, error_callback)
 
