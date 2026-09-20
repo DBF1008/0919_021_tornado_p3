@@ -12,6 +12,7 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+import asyncio
 import logging
 import re
 import socket
@@ -70,6 +71,30 @@ class ChainFutureTest(AsyncTestCase):
         fut.set_result(42)
         result = await fut3
         self.assertEqual(result, 42)
+
+    @gen_test
+    async def test_cancellation_propagates(self):
+        # Cancelling the source future cancels the chained target instead
+        # of raising CancelledError inside the copy callback.
+        fut: Future[int] = Future()
+        fut2: Future[int] = Future()
+        chain_future(fut, fut2)
+        fut.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await fut2
+        self.assertTrue(fut2.cancelled())
+
+    @gen_test
+    async def test_cancellation_does_not_override_completed_target(self):
+        # If the target already completed, cancelling the source must not
+        # clobber its result.
+        fut: Future[int] = Future()
+        fut2: Future[int] = Future()
+        chain_future(fut, fut2)
+        fut2.set_result(42)
+        fut.cancel()
+        await gen.sleep(0)
+        self.assertEqual(fut2.result(), 42)
 
 
 # The following series of classes demonstrate and test various styles

@@ -146,16 +146,26 @@ def chain_future(
 
     The result (success or failure) of ``a`` will be copied to ``b``, unless
     ``b`` has already been completed or cancelled by the time ``a`` finishes.
+    If ``a`` is cancelled, ``b`` is cancelled as well (unless it has already
+    been completed), so that cancellation propagates along the chain instead
+    of surfacing as an unexpected ``CancelledError`` inside the callback.
 
     .. versionchanged:: 5.0
 
        Now accepts both Tornado/asyncio `Future` objects and
        `concurrent.futures.Future`.
 
+    .. versionchanged:: 6.6
+
+       Cancellation of ``a`` is now propagated to ``b``.
+
     """
 
     def copy(a: "Future[_T]") -> None:
         if b.done():
+            return
+        if a.cancelled():
+            b.cancel()
             return
         if hasattr(a, "exc_info") and a.exc_info() is not None:  # type: ignore
             future_set_exc_info(b, a.exc_info())  # type: ignore
